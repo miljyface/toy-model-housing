@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HK Housing Price Model</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  html, body { height: 100%; margin: 0; font: 14px/1.45 system-ui, sans-serif; }
+  #map { height: 100%; }
+  #banner { position: absolute; z-index: 1000; top: 10px; left: 50px; right: 10px;
+            background: #fff; border-radius: 6px; padding: 6px 12px;
+            box-shadow: 0 1px 4px rgba(0,0,0,.3); max-width: 430px; }
+  .popup-form label { display: block; margin: 4px 0; }
+  .popup-form input[type=number] { width: 70px; }
+  .popup-form button { margin-top: 6px; }
+  .result td { padding: 1px 8px 1px 0; }
+  .muted { color: #666; font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="banner"><b>HK housing price model</b> — click anywhere on the map, enter
+  floor / area / public housing, and get an 80% price interval plus the trailing
+  12-month local market trend. <span id="status" class="muted">loading model…</span></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+"use strict";
+const CBD = [22.2819, 114.1585];
+const BBOX = { latMin: 22.1, latMax: 22.6, lngMin: 113.8, lngMax: 114.5 };
+let MODEL = null;
+
+fetch("model.json").then(r => r.json()).then(m => {
+  MODEL = m;
+  document.getElementById("status").textContent = "model ready.";
+});
+
+function treePredict(model, x) {
+  let s = model.baseline;
+  for (const tree of model.trees) {
+    let i = 0;
+    while (tree[i][0] !== -1) i = x[tree[i][0]] <= tree[i][1] ? tree[i][2] : tree[i][3];
+    s += tree[i][4];
+  }
+  return s;
+}
+
+function predict(lat, lng, area, floor, pub) {
+  const dx = (lng - CBD[1]) * 111.32 * Math.cos(22.35 * Math.PI / 180);
+  const dy = (lat - CBD[0]) * 111.32;
+  const x = [lat, lng, Math.log(area), floor, pub ? 1 : 0, Math.hypot(dx, dy)];
+  const m = MODEL.models;
+  let lo = Math.exp(treePredict(m.q10, x) - MODEL.qhat);
+  let hi = Math.exp(treePredict(m.q90, x) + MODEL.qhat);
+  if (lo > hi) [lo, hi] = [hi, lo];
+  const mid = Math.min(Math.max(Math.exp(treePredict(m.q50, x)), lo), hi);
+  const rise = (Math.exp(treePredict(m.trend, [...x, MODEL.t_end]) -
+                         treePredict(m.trend, [...x, MODEL.t_end - 365])) - 1) * 100;
+  return { lo, mid, hi, rise };
+}
+
+const hkd = v => "HK$" + (v / 1e6).toFixed(2) + "M";
+
+const map = L.map("map", { maxBounds: [[22.0, 113.6], [22.7, 114.7]], minZoom: 10 })
+  .setView([22.33, 114.16], 11);
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+  { attribution: "&copy; OpenStreetMap contributors", maxZoom: 18 }).addTo(map);
+
+map.on("click", e => {
+  if (!MODEL) return;
+  const { lat, lng } = e.latlng;
+  const outside = lat < BBOX.latMin || lat > BBOX.latMax ||
+                  lng < BBOX.lngMin || lng > BBOX.lngMax;
+  const el = document.createElement("div");
+  el.className = "popup-form";
+  el.innerHTML = `
+    <b>${lat.toFixed(4)}, ${lng.toFixed(4)}</b>
+    ${outside ? '<div class="muted">outside model coverage (Hong Kong)</div>' : ""}
+    <label>floor <input type="number" name="floor" value="20" min="1" max="79"></label>
+    <label>area (ft&sup2;) <input type="number" name="area" value="500" min="100" max="6000"></label>
+    <label><input type="checkbox" name="pub"> public housing</label>
+    <button>predict</button>`;
+  const popup = L.popup().setLatLng(e.latlng).setContent(el).openOn(map);
+  el.querySelector("button").onclick = () => {
+    const floor = +el.querySelector("[name=floor]").value;
+    const area = +el.querySelector("[name=area]").value;
+    if (!(floor >= 1 && area >= 100)) return;
+    const p = predict(lat, lng, area, floor, el.querySelector("[name=pub]").checked);
+    el.innerHTML = `
+      <b>${lat.toFixed(4)}, ${lng.toFixed(4)}</b>
+      <div class="muted">${area} ft&sup2; &middot; floor ${floor}${outside ? " &middot; extrapolated!" : ""}</div>
+      <table class="result">
+        <tr><td>price range (80%)</td><td><b>${hkd(p.lo)} &ndash; ${hkd(p.hi)}</b></td></tr>
+        <tr><td>point estimate</td><td>${hkd(p.mid)}</td></tr>
+        <tr><td>12-month trend</td><td>${p.rise >= 0 ? "+" : ""}${p.rise.toFixed(1)}%</td></tr>
+      </table>`;
+    popup.update();
+  };
+});
+</script>
+</body>
+</html>
