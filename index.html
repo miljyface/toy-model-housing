@@ -16,22 +16,51 @@
   .popup-form button { margin-top: 6px; }
   .result td { padding: 1px 8px 1px 0; }
   .muted { color: #666; font-size: 12px; }
+  #side { position: absolute; z-index: 1000; top: 70px; right: 10px; width: 210px;
+          background: #fff; border-radius: 6px; padding: 10px 12px;
+          box-shadow: 0 1px 4px rgba(0,0,0,.3); }
+  #side h3 { margin: 0 0 6px; font-size: 14px; }
+  #side label { display: block; margin: 4px 0; }
+  #side select, #side input[type=number] { width: 100px; float: right; }
+  #side button { margin: 6px 4px 0 0; }
+  #legend { height: 10px; border-radius: 3px; margin-top: 8px;
+            background: linear-gradient(to right, #2c7bb6, #abd9e9, #ffffbf, #fdae61, #d7191c); }
+  #legendlab { display: flex; justify-content: space-between; font-size: 11px; color: #555; }
 </style>
 </head>
 <body>
 <div id="map"></div>
-<div id="banner"><b>HK housing price model</b> — click anywhere on the map, enter
-  floor / area / public housing, and get an 80% price interval plus the trailing
-  12-month local market trend. <span id="status" class="muted">loading model…</span></div>
+<div id="banner"><b>Housing Price Model</b> Click anywhere on the map, enter
+  floor / area / public housing. <span id="status" class="muted">wait im loading model</span></div>
+<div id="side">
+  <h3>analytics</h3>
+  <label>metric <select id="hm-metric">
+    <option value="price">median price</option>
+    <option value="ppsf">unit rate&sup2;</option>
+    <option value="trend">expected change</option>
+  </select></label>
+  <label>area (ft&sup2;) <input id="hm-area" type="number" value="500" min="100" max="6000"></label>
+  <label>floor <input id="hm-floor" type="number" value="20" min="1" max="79"></label>
+  <label>public housing <input id="hm-pub" type="checkbox" style="float:right"></label>
+  <button id="hm-render" type="button">render</button>
+  <button id="hm-clear" type="button">clear</button>
+  <div id="legend" hidden></div>
+  <div id="legendlab" hidden><span id="leg-lo"></span><span id="leg-mid"></span><span id="leg-hi"></span></div>
+  <div id="hm-status" class="muted"></div>
+</div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 "use strict";
 const CBD = [22.2819, 114.1585];
 const BBOX = { latMin: 22.1, latMax: 22.6, lngMin: 113.8, lngMax: 114.5 };
-let MODEL = null;
+let MODEL = null, COVER = null;
 
-fetch("model.json").then(r => r.json()).then(m => {
+Promise.all([
+  fetch("model.json").then(r => r.json()),
+  fetch("coverage.json").then(r => r.json()),
+]).then(([m, c]) => {
   MODEL = m;
+  COVER = c;
   document.getElementById("status").textContent = "model ready.";
 });
 
@@ -61,31 +90,42 @@ function predict(lat, lng, area, floor, pub) {
 
 const hkd = v => "HK$" + (v / 1e6).toFixed(2) + "M";
 
-const map = L.map("map", { maxBounds: [[22.0, 113.6], [22.7, 114.7]], minZoom: 10 })
-  .setView([22.33, 114.16], 11);
+const map = L.map("map", {
+  maxBounds: [[22.13, 113.80], [22.58, 114.45]],  // Hong Kong only
+  maxBoundsViscosity: 1.0,
+  minZoom: 11
+}).setView([22.33, 114.16], 11);
 L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
   { attribution: "&copy; OpenStreetMap contributors", maxZoom: 18 }).addTo(map);
 
+const COOLDOWN_MS = 3000;
+let cooldownUntil = 0;
+
 map.on("click", e => {
   if (!MODEL) return;
+  if (e.originalEvent.target.closest(".leaflet-popup")) return;  // click was inside a popup
+  if (Date.now() < cooldownUntil) return;                        // cooldown after a prediction
   const { lat, lng } = e.latlng;
   const outside = lat < BBOX.latMin || lat > BBOX.latMax ||
                   lng < BBOX.lngMin || lng > BBOX.lngMax;
   const el = document.createElement("div");
   el.className = "popup-form";
+  L.DomEvent.disableClickPropagation(el);  // form clicks must not reach the map
   el.innerHTML = `
     <b>${lat.toFixed(4)}, ${lng.toFixed(4)}</b>
     ${outside ? '<div class="muted">outside model coverage (Hong Kong)</div>' : ""}
     <label>floor <input type="number" name="floor" value="20" min="1" max="79"></label>
     <label>area (ft&sup2;) <input type="number" name="area" value="500" min="100" max="6000"></label>
     <label><input type="checkbox" name="pub"> public housing</label>
-    <button>predict</button>`;
-  const popup = L.popup().setLatLng(e.latlng).setContent(el).openOn(map);
+    <button type="button">predict</button>`;
+  const popup = L.popup({ closeOnClick: false, autoClose: true })
+    .setLatLng(e.latlng).setContent(el).openOn(map);
   el.querySelector("button").onclick = () => {
     const floor = +el.querySelector("[name=floor]").value;
     const area = +el.querySelector("[name=area]").value;
     if (!(floor >= 1 && area >= 100)) return;
     const p = predict(lat, lng, area, floor, el.querySelector("[name=pub]").checked);
+    cooldownUntil = Date.now() + COOLDOWN_MS;
     el.innerHTML = `
       <b>${lat.toFixed(4)}, ${lng.toFixed(4)}</b>
       <div class="muted">${area} ft&sup2; &middot; floor ${floor}${outside ? " &middot; extrapolated!" : ""}</div>
@@ -93,10 +133,96 @@ map.on("click", e => {
         <tr><td>price range (80%)</td><td><b>${hkd(p.lo)} &ndash; ${hkd(p.hi)}</b></td></tr>
         <tr><td>point estimate</td><td>${hkd(p.mid)}</td></tr>
         <tr><td>12-month trend</td><td>${p.rise >= 0 ? "+" : ""}${p.rise.toFixed(1)}%</td></tr>
-      </table>`;
+      </table>
+      <div class="muted">map unlocks for a new prediction in ${COOLDOWN_MS / 1000}s</div>`;
     popup.update();
   };
 });
+
+// ---------------------------------------------------------------- heatmap
+const RAMP = [[44,123,182], [171,217,233], [255,255,191], [253,174,97], [215,25,28]];
+function rampColor(u) {
+  const s = Math.min(Math.max(u, 0), 1) * (RAMP.length - 1);
+  const i = Math.min(Math.floor(s), RAMP.length - 2), f = s - i;
+  return RAMP[i].map((a, k) => Math.round(a + f * (RAMP[i + 1][k] - a)));
+}
+
+let overlay = null;
+const $ = id => document.getElementById(id);
+
+function cellValue(metric, lat, lng, logArea, area, floor, pub) {
+  const dx = (lng - CBD[1]) * 111.32 * Math.cos(22.35 * Math.PI / 180);
+  const dy = (lat - CBD[0]) * 111.32;
+  const x = [lat, lng, logArea, floor, pub, Math.hypot(dx, dy)];
+  if (metric === "trend")
+    return (Math.exp(treePredict(MODEL.models.trend, [...x, MODEL.t_end]) -
+                     treePredict(MODEL.models.trend, [...x, MODEL.t_end - 365])) - 1) * 100;
+  const price = Math.exp(treePredict(MODEL.models.q50, x));
+  return metric === "ppsf" ? price / area : price;
+}
+
+function renderHeatmap() {
+  if (!MODEL || !COVER) return;
+  const metric = $("hm-metric").value;
+  const area = +$("hm-area").value || 500;
+  const floor = +$("hm-floor").value || 20;
+  const pub = $("hm-pub").checked ? 1 : 0;
+  const logArea = Math.log(area);
+  const { latMin, lngMin, step, nLat, nLng, rows } = COVER;
+  const vals = new Float64Array(nLat * nLng).fill(NaN);
+  $("hm-render").disabled = true;
+
+  let i = 0;
+  (function chunk() {
+    const stop = Math.min(i + 10, nLat);
+    for (; i < stop; i++) {
+      const lat = latMin + (i + 0.5) * step, row = rows[i];
+      for (let j = 0; j < nLng; j++)
+        if (row[j] === "1")
+          vals[i * nLng + j] = cellValue(metric, lat, lngMin + (j + 0.5) * step,
+                                         logArea, area, floor, pub);
+    }
+    $("hm-status").textContent = `rendering… ${Math.round(100 * i / nLat)}%`;
+    if (i < nLat) return setTimeout(chunk, 0);
+
+    const sorted = Array.from(vals).filter(Number.isFinite).sort((a, b) => a - b);
+    const lo = sorted[Math.floor(sorted.length * 0.02)];
+    const hi = sorted[Math.floor(sorted.length * 0.98)];
+    const cv = document.createElement("canvas");
+    cv.width = nLng; cv.height = nLat;
+    const img = cv.getContext("2d").createImageData(nLng, nLat);
+    for (let r = 0; r < nLat; r++)
+      for (let c = 0; c < nLng; c++) {
+        const v = vals[r * nLng + c];
+        if (!Number.isFinite(v)) continue;
+        const [R, G, B] = rampColor((v - lo) / (hi - lo || 1));
+        const p = ((nLat - 1 - r) * nLng + c) * 4;      // canvas y runs downward
+        img.data[p] = R; img.data[p + 1] = G; img.data[p + 2] = B; img.data[p + 3] = 200;
+      }
+    cv.getContext("2d").putImageData(img, 0, 0);
+    if (overlay) overlay.remove();
+    overlay = L.imageOverlay(cv.toDataURL(), [[latMin, lngMin],
+      [latMin + nLat * step, lngMin + nLng * step]], { opacity: 0.65 }).addTo(map);
+
+    const fmt = v => metric === "trend" ? v.toFixed(1) + "%" :
+                metric === "ppsf" ? "HK$" + Math.round(v / 100) / 10 + "k" : hkd(v);
+    $("legend").hidden = $("legendlab").hidden = false;
+    $("leg-lo").textContent = fmt(lo);
+    $("leg-mid").textContent = fmt((lo + hi) / 2);
+    $("leg-hi").textContent = fmt(hi);
+    $("hm-status").textContent = `${sorted.length.toLocaleString()} cells · ` +
+      `${area} ft² · floor ${floor}${pub ? " · public" : ""}`;
+    $("hm-render").disabled = false;
+  })();
+}
+
+$("hm-render").onclick = renderHeatmap;
+$("hm-clear").onclick = () => {
+  if (overlay) overlay.remove();
+  overlay = null;
+  $("legend").hidden = $("legendlab").hidden = true;
+  $("hm-status").textContent = "";
+};
 </script>
 </body>
 </html>
